@@ -83,7 +83,7 @@ On Windows, `run_app.bat` launches it windowless in the system tray (output goes
 
 ## Support
 
-Enjoying this? If it rescued your key library, consider [helping me afford more treats](https://ko-fi.com/sparklemuffin) for these animals who love each otherrrr (see below). A $5 Ko-fi donation also gets you 5 random games from [my list of excess keys](https://docs.google.com/spreadsheets/d/e/2PACX-1vQ5FmpAzSUApFWaaIH-jOUPP6DMy0KtNCn1_PFOlyoHxBASHovsv34HCE9wlqc0HC_bQtE9lPjxrco1/pubhtml?gid=152746594&single=true); $10 or more and you pick your 5. Leave your picks in the Ko-fi comment and I'll message you the keys.
+Enjoying this? If it rescued your key library, consider [helping me afford more treats](https://ko-fi.com/sparklemuffin) for these animals who love each otherrrr (see below).
 
 ## Puppy and cat tax
 
