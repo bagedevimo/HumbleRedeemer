@@ -34,6 +34,22 @@ fetch('/userData.json', {credentials: 'same-origin'})
 """
 
 
+def _quit_driver(driver):
+    # Grab the service process first: if quit() hangs or raises (the
+    # browser is already wedged), a surviving chromedriver still holds an
+    # orphaned chrome.exe alive after we return.
+    proc = getattr(getattr(driver, "service", None), "process", None)
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 class GogClient:
     def __init__(self):
         self._lock = threading.RLock()
@@ -171,10 +187,7 @@ class GogClient:
             self.login_state = {"status": "error", "message": f"GOG login failed: {e!r}"}
         finally:
             if driver is not None:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+                _quit_driver(driver)
 
     # ---------------- library ----------------
 
@@ -252,10 +265,7 @@ class GogClient:
                 yield (ident, *self._redeem_one(driver, code))
                 time.sleep(1.5)
         finally:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+            _quit_driver(driver)
 
     def _dismiss_cookiebot(self, driver):
         try:
