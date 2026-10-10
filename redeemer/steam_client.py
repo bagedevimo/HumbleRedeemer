@@ -7,6 +7,7 @@ script used.
 import re
 import threading
 import time
+from urllib.parse import urlparse
 
 import requests
 import steam.webauth as wa
@@ -71,17 +72,52 @@ class SteamClient:
         self._lock = threading.RLock()
         self._webauth = None  # pending login awaiting a code
         self._poll_stop = None  # Event that halts the approval poller thread
+        # What the last check against Steam proved: 'ok' (signed in),
+        # 'offline' (no answer) or 'signed_out'. Drives the header light.
+        self.conn_state = "signed_out"
+        self.conn_checked = 0.0
 
     # ---------------- session ----------------
 
-    def _session_valid(self, session):
+    def _check_session(self, session):
+        """Ask Steam whether this session is signed in. Returns 'ok',
+        'signed_out', or 'offline' when Steam gave no usable answer (network
+        down, Tuesday maintenance, rate limit, a block page).
+
+        Follows redirects so an expired access token can refresh through
+        login.steampowered.com, then needs proof either way on the final
+        page. Landing on /login/, logged_in:false or g_AccountID = 0 means
+        signed out. Signed in means a nonzero g_AccountID, logged_in:true, or
+        the key page itself loading: Steam redirects signed-out visitors away
+        from it. Any other page (a bare 200 included) proves nothing."""
         try:
-            r = session.get(STEAM_KEYS_PAGE, allow_redirects=False, timeout=30)
-            return r.status_code not in (301, 302, 401, 403)
+            r = session.get(STEAM_KEYS_PAGE, timeout=20)
         except requests.RequestException:
-            return False
+            return "offline"
+        text = r.text if r.status_code == 200 else ""
+        path = urlparse(r.url).path
+        if ("/login" in path
+                or "&quot;logged_in&quot;:false" in text
+                or re.search(r"g_AccountID\s*=\s*0\s*;", text)):
+            return "signed_out"
+        if (re.search(r"g_AccountID\s*=\s*[1-9]\d*\s*;", text)
+                or "&quot;logged_in&quot;:true" in text
+                or (text and path.startswith("/account/registerkey"))):
+            return "ok"
+        return "offline"
+
+    def _record(self, state):
+        self.conn_state = state
+        self.conn_checked = time.time()
+        return state
+
+    def connection(self):
+        return {"state": self.conn_state, "checked": self.conn_checked}
 
     def is_logged_in(self, recheck=False):
+        """Without recheck: whether a session is held (it may be unverified
+        while Steam is unreachable). With recheck: whether Steam confirms
+        it right now; a session Steam rejects is dropped."""
         if self._session is None:
             return False
         if not recheck:
@@ -89,22 +125,34 @@ class SteamClient:
         with self._lock:
             if self._session is None:
                 return False
-            ok = self._session_valid(self._session)
-            if not ok:
+            state = self._record(self._check_session(self._session))
+            if state == "signed_out":
                 self._session = None
-            return ok
+            return state == "ok"
 
     def try_cookie_login(self):
         with self._lock:
             cookie_dict = load_cookie_dict(COOKIE_FILE)
             if cookie_dict is None:
+                if self._session is None:
+                    self._record("signed_out")
                 return False
             session = requests.Session()
             session.cookies.update(requests.utils.cookiejar_from_dict(cookie_dict))
-            if self._session_valid(session):
+            state = self._record(self._check_session(session))
+            # offline: keep the saved session so the next check can confirm
+            # it once Steam answers, instead of needing a fresh sign-in
+            if state != "signed_out":
                 self._session = session
-                return True
-            return False
+            return state == "ok"
+
+    def refresh_connection(self):
+        """Periodic check behind the header light: re-verify a held session,
+        or retry the saved cookies if Steam was unreachable at startup."""
+        if self._session is not None:
+            self.is_logged_in(recheck=True)
+        elif self.conn_state == "offline":
+            self.try_cookie_login()
 
     def _guard_prompt(self):
         allowed = set(getattr(self._webauth, "allowed_confirmations", []) or [])
@@ -158,9 +206,15 @@ class SteamClient:
         threading.Thread(target=_poll, daemon=True).start()
 
     def _finish_login(self, session):
-        self._session = session
         self._webauth = None
         self._cancel_poller()
+        # the auth flow finished; make the store itself confirm the session
+        # before the light goes green
+        if self._record(self._check_session(session)) == "signed_out":
+            return {"status": "error",
+                    "message": "Steam accepted the sign-in, but the store still "
+                               "says signed out. Try signing in again."}
+        self._session = session
         try:
             save_cookie_dict(COOKIE_FILE, requests.utils.dict_from_cookiejar(session.cookies))
         except Exception:

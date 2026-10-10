@@ -10,10 +10,11 @@ import time
 from base64 import b64encode
 
 from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 from .cookie_store import load_cookie_list, save_cookie_list
 
+HUMBLE_ORIGIN = "https://www.humblebundle.com/"
 HUMBLE_LOGIN_PAGE = "https://www.humblebundle.com/login"
 HUMBLE_KEYS_PAGE = "https://www.humblebundle.com/home/library"
 HUMBLE_LOGIN_API = "https://www.humblebundle.com/processlogin"
@@ -66,10 +67,33 @@ fetch("{url}", {{
 }}).then(r => {{ r.json().then( v => {{done([r.status, v])}} ) }} );
 '''
 
-IS_LOGGED_IN_JS = '''
+# Proof of a live session: the orders API answers a signed-in session with a
+# JSON list and a signed-out one with 401. Anything else (network error,
+# Cloudflare page, 5xx) proves nothing either way. Self-aborts so a dead
+# network can't hold the browser for the 300s script timeout.
+CHECK_SESSION_JS = '''
 var done = arguments[arguments.length-1];
-fetch("https://www.humblebundle.com/home/library").then(r => {done(!r.redirected)})
+var ctl = new AbortController();
+setTimeout(() => ctl.abort(), 20000);
+fetch("https://www.humblebundle.com/api/v1/user/order",
+      {credentials: "same-origin", signal: ctl.signal})
+  .then(r => {
+    if (r.status === 401 || (r.redirected && r.url.indexOf("/login") >= 0)) {
+      done("signed_out"); return;
+    }
+    if (!r.ok) { done("offline"); return; }
+    return r.json().then(j => done(Array.isArray(j) ? "ok" : "offline"),
+                         () => done("offline"));
+  })
+  .catch(() => done("offline"));
 '''
+
+
+def _network_error(err):
+    """chromedriver reports a navigation that couldn't reach the site
+    (offline, DNS failure) as a WebDriverException carrying a net::ERR_ code.
+    That is a dead connection, not a dead browser."""
+    return "net::ERR_" in str(err)
 
 
 def find_dict_keys(node, kv, parent=False):
@@ -89,6 +113,10 @@ class HumbleClient:
         self._lock = threading.RLock()
         self._logged_in = False
         self._pending_payload = None  # login payload awaiting guard/2FA
+        # What the last check against Humble proved: 'ok' (signed in),
+        # 'offline' (no answer) or 'signed_out'. Drives the header light.
+        self.conn_state = "signed_out"
+        self.conn_checked = 0.0
 
     # ---------------- driver ----------------
 
@@ -148,6 +176,7 @@ class HumbleClient:
         process). Drop it so the next call starts a fresh one and restores
         the session from cookies, instead of failing forever until restart."""
         self.shutdown()
+        self._record("offline")  # lets the session watcher restore it
         first = str(err).splitlines()[0] if str(err) else err.__class__.__name__
         return RuntimeError(
             "The Humble browser session crashed and was reset — try the same "
@@ -166,23 +195,48 @@ class HumbleClient:
 
     # ---------------- session ----------------
 
+    def _record(self, state):
+        self.conn_state = state
+        self.conn_checked = time.time()
+        return state
+
+    def connection(self):
+        return {"state": self.conn_state, "checked": self.conn_checked}
+
+    def _check_session(self, driver):
+        """Ask Humble whether the browser's session is signed in: 'ok',
+        'signed_out' or 'offline'. Caller holds the lock."""
+        try:
+            if not driver.current_url.startswith(HUMBLE_ORIGIN):
+                # A load that failed while offline leaves Chrome on its error
+                # page. The check's fetch must run from Humble's own origin to
+                # carry the session cookies, or it reads as signed out.
+                driver.get(HUMBLE_KEYS_PAGE)
+                if not driver.current_url.startswith(HUMBLE_ORIGIN):
+                    return "offline"
+            return driver.execute_async_script(CHECK_SESSION_JS) or "offline"
+        except TimeoutException:
+            return "offline"
+        except WebDriverException as e:
+            if _network_error(e):
+                return "offline"
+            raise self._driver_crashed(e) from e
+
     def is_logged_in(self, recheck=False):
+        """Without recheck: whether a session is held (it may be unverified
+        while Humble is unreachable). With recheck: whether Humble confirms
+        it right now; a session Humble rejects is dropped."""
         # Non-blocking: if another thread holds the driver (login, sync,
         # reveal), report the last known state instead of stalling the UI.
         if not self._lock.acquire(blocking=False):
-            return self._logged_in
+            return self._logged_in and (not recheck or self.conn_state == "ok")
         try:
-            if self._logged_in and not recheck:
-                return True
-            if self._driver is None:
-                return False
-            if recheck:
-                try:
-                    self._logged_in = bool(
-                        self._driver.execute_async_script(IS_LOGGED_IN_JS))
-                except Exception:
-                    self._logged_in = False
-            return self._logged_in
+            if not recheck or not self._logged_in or self._driver is None:
+                return self._logged_in
+            state = self._record(self._check_session(self._driver))
+            if state == "signed_out":
+                self._logged_in = False
+            return state == "ok"
         finally:
             self._lock.release()
 
@@ -191,20 +245,49 @@ class HumbleClient:
         with self._lock:
             cookies = load_cookie_list(COOKIE_FILE)
             if not cookies:
+                if not self._logged_in:
+                    self._record("signed_out")
                 return False
             driver = self._ensure_driver()
-            driver.get(HUMBLE_LOGIN_PAGE)
-            for cookie in cookies:
-                try:
-                    driver.add_cookie(cookie)
-                except Exception:
-                    pass
-            driver.get(HUMBLE_KEYS_PAGE)
-            time.sleep(2)
-            ok = ("login" not in driver.current_url
-                  and "onboarding" not in driver.current_url)
-            self._logged_in = ok
-            return ok
+            try:
+                driver.get(HUMBLE_LOGIN_PAGE)
+                # cookies only attach to the page's own domain: if Humble
+                # didn't load (offline), don't claim a session; the watcher
+                # retries the restore once Humble answers
+                if not driver.current_url.startswith(HUMBLE_ORIGIN):
+                    self._record("offline")
+                    return False
+                for cookie in cookies:
+                    try:
+                        driver.add_cookie(cookie)
+                    except Exception:
+                        pass
+                driver.get(HUMBLE_KEYS_PAGE)
+            except TimeoutException:
+                self._record("offline")
+                return False
+            except WebDriverException as e:
+                if _network_error(e):
+                    self._record("offline")
+                    return False
+                raise self._driver_crashed(e) from e
+            state = self._record(self._check_session(driver))
+            self._logged_in = state != "signed_out"
+            return state == "ok"
+
+    def refresh_connection(self):
+        """Periodic check behind the header light: re-verify a held session,
+        or retry the saved cookies if Humble was unreachable before. Skips
+        while a job holds the browser; the job is exercising the session."""
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            if self._logged_in:
+                self.is_logged_in(recheck=True)
+            elif self.conn_state == "offline":
+                self.try_cookie_login()
+        finally:
+            self._lock.release()
 
     def login(self, email=None, password=None, code=None, guard=None):
         """Drive the Humble login flow. Returns a dict:
@@ -254,7 +337,13 @@ class HumbleClient:
                 if status != 200 and "errors" in login_json:
                     return {"status": "error", "message": str(login_json["errors"])}
 
-            # success
+            # Looks like success; make Humble confirm the session before the
+            # light goes green (an unrecognized reply would otherwise land here)
+            state = self._record(self._check_session(driver))
+            if state == "signed_out":
+                self._logged_in = False
+                return {"status": "error",
+                        "message": "Humble didn't accept the sign-in. Try again."}
             self._pending_payload = None
             self._logged_in = True
             try:

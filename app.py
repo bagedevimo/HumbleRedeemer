@@ -119,6 +119,24 @@ def _restore_sessions():
         pass
 
 
+SESSION_CHECK_SECONDS = 120
+
+
+def _watch_sessions():
+    """Keep the header lights honest. A green light means the last check
+    asked Humble/Steam and got proof of a signed-in session, so re-ask on a
+    timer: an expired cookie or a dropped connection turns the light off
+    instead of leaving it green until restart."""
+    _restore_sessions()
+    while True:
+        time.sleep(SESSION_CHECK_SECONDS)
+        for client in (steam, humble):
+            try:
+                client.refresh_connection()
+            except Exception:
+                pass
+
+
 def _startup_update_scan():
     """Non-blocking update check at launch; result is cached for the UI."""
     status = update_check.get_status()
@@ -133,7 +151,7 @@ def _startup_update_scan():
 
 
 if not os.environ.get("APP_NO_RESTORE"):
-    threading.Thread(target=_restore_sessions, daemon=True).start()
+    threading.Thread(target=_watch_sessions, daemon=True).start()
 if not os.environ.get("APP_NO_UPDATE_CHECK"):
     threading.Thread(target=_startup_update_scan, daemon=True).start()
 
@@ -202,9 +220,14 @@ def api_state():
         "version": APP_VERSION,
         "metrics": store.metrics(),
         "job": runner.snapshot(),
+        # humble/steam are true only when the last check proved a live
+        # session; *_conn carries the state ('ok' | 'offline' |
+        # 'signed_out') and when it was checked, for the light's tooltip
         "logins": {
-            "humble": humble.is_logged_in(),
-            "steam": steam.is_logged_in(),
+            "humble": humble.conn_state == "ok",
+            "steam": steam.conn_state == "ok",
+            "humble_conn": humble.connection(),
+            "steam_conn": steam.connection(),
             "gog": gog.is_logged_in(),
             "gog_login": gog.login_state,
         },

@@ -114,11 +114,14 @@ class JobRunner:
     # ---------------- jobs ----------------
 
     def _require_humble(self):
-        if self.humble.is_logged_in():
+        if self.humble.is_logged_in(recheck=True):
             return True
         self._say("Trying saved Humble session...")
         if self.humble.try_cookie_login():
             return True
+        if getattr(self.humble, "conn_state", "") == "offline":
+            raise RuntimeError("Can't reach Humble right now. Check your "
+                               "connection and try again.")
         raise RuntimeError("Not signed in to Humble — use the Sign in button first.")
 
     def _require_steam(self):
@@ -127,6 +130,9 @@ class JobRunner:
         self._say("Trying saved Steam session...")
         if self.steam.try_cookie_login():
             return True
+        if getattr(self.steam, "conn_state", "") == "offline":
+            raise RuntimeError("Can't reach Steam right now (connection down or "
+                               "Steam maintenance). Try again shortly.")
         raise RuntimeError("Not signed in to Steam — use the Sign in button first.")
 
     def _job_sync_humble(self, params):

@@ -68,6 +68,7 @@ nav button.active { color: var(--ink-1); font-weight: 650; background: var(--pag
 }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--critical); }
 .dot.on { background: var(--good); }
+.dot.warn { background: var(--warn); }
 main { max-width: 1200px; margin: 0 auto; padding: 20px; }
 .grid { display: grid; gap: 14px; }
 .tiles { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
@@ -666,11 +667,29 @@ async function poll() {
   setTimeout(poll, state && state.job.running ? 1200 : 2500);
 }
 
+// Green only when the server's last check got proof of a signed-in session;
+// amber when a session is saved but the service didn't answer the check.
+function renderConn(id, name, conn) {
+  conn = conn || { state: "signed_out", checked: 0 };
+  $("#dot-" + id).classList.toggle("on", conn.state === "ok");
+  $("#dot-" + id).classList.toggle("warn", conn.state === "offline");
+  let when = "";
+  if (conn.checked) {
+    const s = Math.max(0, Math.round(Date.now() / 1000 - conn.checked));
+    when = s < 90 ? ` (checked ${s}s ago)` : ` (checked ${Math.round(s / 60)} min ago)`;
+  }
+  $("#chip-" + id).title = conn.state === "ok"
+    ? `Connected: ${name} confirmed your session${when}`
+    : conn.state === "offline"
+      ? `Saved session, but ${name} isn't answering right now${when}. Rechecks every 2 min.`
+      : `Not signed in to ${name}. Click to sign in.`;
+}
+
 function render() {
   const m = state.metrics, j = state.job;
   $("#ver").textContent = state.version ? "· " + state.version : "";
-  $("#dot-humble").classList.toggle("on", state.logins.humble);
-  $("#dot-steam").classList.toggle("on", state.logins.steam);
+  renderConn("humble", "Humble", state.logins.humble_conn);
+  renderConn("steam", "Steam", state.logins.steam_conn);
   // GOG sign-in disabled for now (chip is commented out in the header)
   // $("#dot-gog").classList.toggle("on", state.logins.gog);
   // in-app Steam Guard approval picked up by the backend poller

@@ -15,6 +15,8 @@
 2. Run it. The dashboard opens at `http://127.0.0.1:5757` in whatever browser you use (Chrome, Firefox, Opera GX, anything).
 3. Sign in to Humble and Steam from the header chips (2FA/Steam Guard supported), then hit **▶ Full auto run**.
 
+The dot on each chip only goes green when that service actually confirms your session, and the app rechecks every couple of minutes, so an expired login or a dropped connection shows up right away instead of mid run. Amber means you have a saved session but the service isn't answering right now (your connection, or Steam's Tuesday maintenance). Red means sign in. Hover the chip to see when it last checked.
+
 On Windows the app lives in the **system tray** (blue key icon by the clock): closing the browser tab just "minimizes" it. The app keeps running in the background, and reopening `http://127.0.0.1:5757` (or double-clicking the tray icon) brings it right back. Quit from the tray icon's menu or the ⏻ chip in the dashboard. Prefer a plain console window instead? Untick *Run in the system tray* in Settings.
 
 The Humble automation runs in a separate hidden browser using Chrome or Firefox; if neither is installed, Selenium usually downloads a private copy of Chrome automatically. Windows builds are signed (publisher: Charles Chambers). macOS builds are unsigned, so right-click and Open the first time.
