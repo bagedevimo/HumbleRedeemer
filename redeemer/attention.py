@@ -109,6 +109,8 @@ def build_report(store):
     for k in keys:
         entry = {
             "id": k["id"], "human_name": k["human_name"], "service": k["service"],
+            # the order this key came from, for the UI's link to its Humble page
+            "gamekey": k["gamekey"],
             "key": k["redeemed_key_val"], "revealed": k["revealed"],
             "expires": (k["expires"] or "")[:10],
             "redeem_status": k["redeem_status"],
