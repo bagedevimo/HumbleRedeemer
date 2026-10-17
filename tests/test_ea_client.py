@@ -132,37 +132,96 @@ class FakeResponse:
         self.headers = headers or {}
 
 
+LOGIN_REQUIRED = FakeResponse(200, json.dumps({"error": "login_required"}))
+DX_LOGIN_REQUIRED = FakeResponse(302, "", {"Location":
+    "https://www.ea.com/static-pages/auth.html#error_code=login_required&error=login_required"})
+
+
 class FakeSession:
-    def __init__(self, response):
-        self.response = response
+    """Answers each auth client's prompt=none request: `by_client` maps a
+    client_id to its FakeResponse; clients not listed get `default`."""
+    def __init__(self, default, **by_client):
+        self.default = default
+        self.by_client = by_client
+        self.asked = []
 
     def get(self, url, **kwargs):
-        assert url == ea_client.EA_TOKEN_URL
-        return self.response
+        from urllib.parse import parse_qs, urlparse
+        q = parse_qs(urlparse(url).query)
+        assert url.startswith(ea_client.EA_AUTH) and q["prompt"] == ["none"]
+        client = q["client_id"][0]
+        self.asked.append(client)
+        return self.by_client.get(client, self.default)
+
+
+def _with_session(monkeypatch, session):
+    monkeypatch.setattr(ea_client, "load_cookie_list", lambda path: [{"name": "sid", "value": "v"}])
+    monkeypatch.setattr(ea_client, "make_session", lambda cookies: session)
 
 
 def test_try_cookie_login_signed_out_drops_session(monkeypatch):
-    monkeypatch.setattr(ea_client, "load_cookie_list", lambda path: [{"name": "sid", "value": "v"}])
-    monkeypatch.setattr(ea_client, "make_session", lambda cookies: FakeSession(
-        FakeResponse(200, json.dumps({"error": "login_required"}))))
+    _with_session(monkeypatch, FakeSession(LOGIN_REQUIRED, DX_DROP_JS_WEB_APP=DX_LOGIN_REQUIRED))
     client = EaClient()
     assert client.try_cookie_login() is False
     assert client.conn_state == "signed_out" and client._session is None
 
 
 def test_try_cookie_login_offline_keeps_session(monkeypatch):
-    monkeypatch.setattr(ea_client, "load_cookie_list", lambda path: [{"name": "sid", "value": "v"}])
-    monkeypatch.setattr(ea_client, "make_session", lambda cookies: FakeSession(
-        FakeResponse(503, "")))
+    _with_session(monkeypatch, FakeSession(FakeResponse(503, "")))
     client = EaClient()
     assert client.try_cookie_login() is False
     assert client.conn_state == "offline" and client._session is not None
 
 
+def test_one_client_signed_out_one_offline_is_offline(monkeypatch):
+    _with_session(monkeypatch, FakeSession(FakeResponse(503, ""), ORIGIN_JS_SDK=LOGIN_REQUIRED))
+    client = EaClient()
+    assert client.try_cookie_login() is False
+    assert client.conn_state == "offline"
+
+
 def test_try_cookie_login_ok_caches_token(monkeypatch):
-    monkeypatch.setattr(ea_client, "load_cookie_list", lambda path: [{"name": "sid", "value": "v"}])
-    monkeypatch.setattr(ea_client, "make_session", lambda cookies: FakeSession(
-        FakeResponse(200, json.dumps({"access_token": "tok"}))))
+    session = FakeSession(FakeResponse(200, json.dumps({"access_token": "tok"})))
+    _with_session(monkeypatch, session)
     client = EaClient()
     assert client.try_cookie_login() is True
     assert client.is_logged_in() and client._access_token() == "tok"
+    assert client.token_client == "ORIGIN_JS_SDK" and session.asked == ["ORIGIN_JS_SDK"]
+
+
+def test_falls_back_to_website_client_for_the_token(monkeypatch):
+    _with_session(monkeypatch, FakeSession(LOGIN_REQUIRED, DX_DROP_JS_WEB_APP=FakeResponse(
+        302, "", {"Location": "https://www.ea.com/static-pages/auth.html#access_token=dx&expires_in=3599"})))
+    client = EaClient()
+    assert client.try_cookie_login() is True
+    assert client._access_token() == "dx" and client.token_client == "DX_DROP_JS_WEB_APP"
+
+
+def test_get_owned_retries_with_the_next_client_when_a_token_is_rejected(monkeypatch):
+    _with_session(monkeypatch, FakeSession(FakeResponse(200, json.dumps({"access_token": "js"})),
+                                           DX_DROP_JS_WEB_APP=FakeResponse(
+        302, "", {"Location": "https://www.ea.com/static-pages/auth.html#access_token=dx"})))
+    client = EaClient()
+    assert client.try_cookie_login() is True
+
+    def query(token, cursor):
+        if token == "js":
+            return {"data": None, "errors": [{"message": "Not authenticated.",
+                                              "extensions": {"code": "UNAUTHENTICATED"}}]}
+        return _page([_item("A")])
+    monkeypatch.setattr(client, "_query", query)
+    assert [g["name"] for g in client.get_owned()] == ["A"]
+    assert client.token_client == "DX_DROP_JS_WEB_APP"
+
+
+def test_get_owned_gives_up_once_every_client_is_rejected(monkeypatch):
+    _with_session(monkeypatch, FakeSession(FakeResponse(200, json.dumps({"access_token": "js"})),
+                                           DX_DROP_JS_WEB_APP=FakeResponse(
+        302, "", {"Location": "https://www.ea.com/static-pages/auth.html#access_token=dx"})))
+    client = EaClient()
+    client.try_cookie_login()
+    monkeypatch.setattr(client, "_query", lambda token, cursor: {
+        "errors": [{"extensions": {"code": "UNAUTHENTICATED"}}]})
+    with pytest.raises(EaAuthRejected) as e:
+        client.get_owned()
+    assert "ORIGIN_JS_SDK, DX_DROP_JS_WEB_APP" in str(e.value)

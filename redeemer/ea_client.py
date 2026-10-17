@@ -33,17 +33,36 @@ from .cookie_store import load_cookie_list, save_cookie_list
 from .driverutil import chrome_service
 
 EA_AUTH = "https://accounts.ea.com/connect/auth"
-EA_WEB_CLIENT = "ORIGIN_JS_SDK"
-# Without prompt=none this redirects a signed-out browser to signin.ea.com
-# and back; with it, it returns JSON either way — a token or login_required.
-EA_SIGNIN_URL = (f"{EA_AUTH}?client_id={EA_WEB_CLIENT}&response_type=token"
-                 "&redirect_uri=nucleus:rest")
-EA_TOKEN_URL = EA_SIGNIN_URL + "&prompt=none"
 EA_GRAPHQL = "https://service-aggregation-layer.juno.ea.com/graphql"
 
+# Web auth clients that hand a signed-in cookie jar a token with
+# prompt=none, tried in order. Without prompt=none they redirect a
+# signed-out browser to signin.ea.com and back.
+#   ORIGIN_JS_SDK       answers with a JSON body (or login_required JSON)
+#   DX_DROP_JS_WEB_APP  www.ea.com's own client; answers with a redirect to
+#                       its auth page carrying the token in the fragment
+TOKEN_CLIENTS = [
+    ("ORIGIN_JS_SDK", "nucleus:rest"),
+    ("DX_DROP_JS_WEB_APP", "https://www.ea.com/static-pages/auth.html"),
+]
+
+
+def auth_url(client_id, redirect_uri, silent=True):
+    from urllib.parse import urlencode
+    params = {"client_id": client_id, "response_type": "token",
+              "redirect_uri": redirect_uri}
+    if silent:
+        params["prompt"] = "none"
+    return f"{EA_AUTH}?{urlencode(params)}"
+
+
+# Sign-in starts the way www.ea.com's own "Sign in" does, since that's the
+# flow EA's sign-in page is used to seeing from real browsers.
+EA_SIGNIN_URL = auth_url(*TOKEN_CLIENTS[1], silent=False)
+
 COOKIE_FILE = ".eacookies"
-USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 
 # The service rejects requests without a browser-style User-Agent by never
 # answering, so every request carries one and a timeout.
@@ -178,6 +197,27 @@ def _all_cookies(driver):
         return driver.get_cookies()
 
 
+def _signin_driver():
+    """A visible Chrome that doesn't announce it's automated. EA's sign-in
+    page refuses a stock Selenium Chrome ("Your request cannot be
+    completed. Service limitations apply."): it shows the "controlled by
+    automated software" switch and sets navigator.webdriver. Chrome's own
+    User-Agent is kept, since a spoofed one that disagrees with the
+    browser's other signals is its own giveaway."""
+    opts = webdriver.ChromeOptions()
+    opts.add_argument("--window-size=1100,850")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    driver = webdriver.Chrome(options=opts, service=chrome_service())
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"})
+    except Exception:
+        pass  # not Chrome, or an old driver — the flags above still apply
+    return driver
+
+
 def _quit_driver(driver):
     proc = getattr(getattr(driver, "service", None), "process", None)
     try:
@@ -202,9 +242,11 @@ class EaClient:
         # 'offline' (no answer) or 'signed_out'. Drives the header light.
         self.conn_state = "signed_out"
         self.conn_checked = 0.0
-        # The last raw token-check reply, for diagnosing a sign-in that never
-        # completes: {status, location, body, url}
+        # The last raw token-check reply per client, for diagnosing a
+        # sign-in that never completes: {client: {status, location, body}}
         self.last_check = {}
+        # which TOKEN_CLIENTS entry the held token came from
+        self.token_client = ""
 
     # ---------------- session ----------------
 
@@ -216,17 +258,37 @@ class EaClient:
     def connection(self):
         return {"state": self.conn_state, "checked": self.conn_checked}
 
-    def _fetch_token(self, session):
-        """('ok', token) | ('signed_out', None) | ('offline', None)."""
+    def _fetch_client_token(self, session, client_id, redirect_uri):
+        """One client's prompt=none answer: ('ok', token) | ('signed_out',
+        None) | ('offline', None)."""
         try:
-            r = session.get(EA_TOKEN_URL, timeout=TIMEOUT, allow_redirects=False)
+            r = session.get(auth_url(client_id, redirect_uri),
+                            timeout=TIMEOUT, allow_redirects=False)
         except requests.RequestException as e:
-            self.last_check = {"error": f"{e.__class__.__name__}: {e}"[:300]}
+            self.last_check[client_id] = {"error": f"{e.__class__.__name__}: {e}"[:300]}
             return "offline", None
         location = r.headers.get("Location", "")
-        self.last_check = {"status": r.status_code, "location": location[:300],
-                           "body": (r.text or "")[:300]}
+        self.last_check[client_id] = {"status": r.status_code,
+                                      "location": location[:300],
+                                      "body": (r.text or "")[:300]}
         return parse_token_response(r.status_code, r.text, location)
+
+    def _fetch_token(self, session, skip=()):
+        """The first token any client hands over, as (state, token); sets
+        token_client. Signed out only when every client says so — one
+        client answering oddly is no proof the session is gone."""
+        states = []
+        for client_id, redirect_uri in TOKEN_CLIENTS:
+            if client_id in skip:
+                continue
+            state, token = self._fetch_client_token(session, client_id, redirect_uri)
+            if state == "ok":
+                self.token_client = client_id
+                return state, token
+            states.append(state)
+        if states and all(s == "signed_out" for s in states):
+            return "signed_out", None
+        return "offline", None
 
     def is_logged_in(self):
         return self._session is not None and self.conn_state == "ok"
@@ -291,10 +353,7 @@ class EaClient:
         signed-in driver before it closes (the probe uses it)."""
         driver = None
         try:
-            opts = webdriver.ChromeOptions()
-            opts.add_argument("--window-size=1100,850")
-            opts.add_experimental_option("excludeSwitches", ["enable-logging"])
-            driver = webdriver.Chrome(options=opts, service=chrome_service())
+            driver = _signin_driver()
             driver.get(EA_SIGNIN_URL)
             deadline = time.time() + timeout
             session = None
@@ -368,8 +427,26 @@ class EaClient:
         return payload
 
     def get_owned(self):
-        """Every owned product as parse_owned_page() dicts."""
+        """Every owned product as parse_owned_page() dicts. If the library
+        service refuses one client's token, the next client's is tried."""
         token = self._access_token()
+        rejected = []
+        while True:
+            try:
+                return self._get_owned_with(token)
+            except EaAuthRejected:
+                rejected.append(self.token_client)
+                with self._lock:
+                    self._token = None
+                    state, token = (self._fetch_token(self._session, skip=rejected)
+                                    if self._session is not None else ("signed_out", None))
+                if state != "ok":
+                    raise EaAuthRejected(
+                        "EA's library service rejected the token from every web "
+                        f"sign-in client tried ({', '.join(rejected)}).")
+                self._token, self._token_expires = token, time.time() + 50 * 60
+
+    def _get_owned_with(self, token):
         owned, cursor, seen = [], "0", set()
         for _ in range(50):  # backstop against a pager loop
             items, cursor, _total = parse_owned_page(self._query(token, cursor))
@@ -433,13 +510,13 @@ def _probe(argv):
         for k, v in client.last_check.items():
             print(f"  {k}: {v}")
         return 1
-    print("ok.")
+    print(f"ok (from {client.token_client}).")
 
     print("Asking EA for your library...")
     try:
         owned = client.get_owned()
-    except EaAuthRejected:
-        print("REJECTED: EA's library service refused the web token. Copy the "
+    except EaAuthRejected as e:
+        print(f"REJECTED: {e} Copy the "
               "'ea.com pages talked to' line above (run with --login to see it) "
               "into the chat; one of those client ids is the next thing to try.")
         return 2
@@ -447,7 +524,7 @@ def _probe(argv):
         print(f"failed: {e.__class__.__name__}: {e}")
         return 1
 
-    print(f"EA says you own {len(owned)} products.")
+    print(f"EA says you own {len(owned)} products (token from {client.token_client}).")
     methods = {}
     for g in owned:
         for m in g["ownership"] or ["(none listed)"]:
