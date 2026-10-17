@@ -1434,14 +1434,10 @@ function copyNamesList() {
   alert(`Copied ${rows.length} game names (no keys) as a Reddit-ready list. Duplicates are adjacent.`);
 }
 function exportNames() {
-  const rows = [["game","expires"]];
+  const rows = [["game","expires", ...friendCsvHeader()]];
   sparesForNamesList().forEach(g =>
-    rows.push([g.human_name, g.expires ? g.expires.slice(0,10) : "never"]));
-  const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob(["﻿" + csv], { type: "text/csv" }));
-  a.download = "giveaway_names.csv";
-  a.click();
+    rows.push([g.human_name, g.expires ? g.expires.slice(0,10) : "never", ...friendCsvCells(g)]));
+  downloadCsv(rows, "giveaway_names.csv");
 }
 function emailOne(id) {
   const g = spares.find(s => s.id === id);
@@ -1457,12 +1453,19 @@ function emailSpares() {
   if (!list.length) { alert("Select some rows first."); return; }
   mailtoSpare(list);
 }
-const SPARE_CSV_HEADER = ["title","key_or_link","expires","status","ownership","given_away","given_at","note"];
+// one column per tracked friend: yes / no, or unknown when their library is hidden
+const friendCsvHeader = () => friends.map(f => `${friendName(f)} has it`);
+function friendCsvCells(g) {
+  const lacking = new Set(g.friends_lacking || []), unknown = new Set(g.friends_unknown || []);
+  return friends.map(f => unknown.has(f.steamid) ? "unknown" : lacking.has(f.steamid) ? "no" : "yes");
+}
+const spareCsvHeader = () => ["title","key_or_link","expires","status","ownership","given_away","given_at","note",
+  ...friendCsvHeader()];
 function spareCsvRow(g, ownership) {
   return [g.human_name, g.redeemed_key_val || "unrevealed",
     g.expires ? g.expires.slice(0,10) : "never",
     g.redeem_status || g.match_status, ownership ?? (g.license_provenance || ""),
-    g.given_away ? "yes" : "no", g.given_at || "", g.notes || ""];
+    g.given_away ? "yes" : "no", g.given_at || "", g.notes || "", ...friendCsvCells(g)];
 }
 function downloadCsv(rows, filename) {
   const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
@@ -1474,7 +1477,7 @@ function downloadCsv(rows, filename) {
 function exportSpares() {
   // giftable only: good-to-go spares plus two-key pairs; solitary
   // likely-redeemed keys stay out (use Export selected to pull those)
-  const rows = [SPARE_CSV_HEADER];
+  const rows = [spareCsvHeader()];
   goodSpares().forEach(g => rows.push(spareCsvRow(g)));
   pairUnits().forEach(pair => pair.forEach(g =>
     rows.push(spareCsvRow(g, "pair_one_of_these_is_good"))));
@@ -1482,7 +1485,7 @@ function exportSpares() {
 }
 function exportSelected() {
   if (!gselected.size) { alert("Select some rows first."); return; }
-  const rows = [SPARE_CSV_HEADER];
+  const rows = [spareCsvHeader()];
   spares.filter(g => gselected.has(g.id)).forEach(g => rows.push(spareCsvRow(g)));
   downloadCsv(rows, "giveaway_selected.csv");
 }
