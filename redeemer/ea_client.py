@@ -11,10 +11,9 @@ answers web tokens. So:
     (client ORIGIN_JS_SDK, prompt=none), which answers a signed-in cookie
     jar with JSON instead of a login page. No browser is needed for that
     after the first sign-in.
-  - The library is one GraphQL query against
-    service-aggregation-layer.juno.ea.com, paged. Each owned product
-    carries EA's ownershipMethods (e.g. REDEMPTION for a product key,
-    PURCHASE, ENTITLEMENT_GRANT for subscriptions).
+  - The library comes from service-aggregation-layer.juno.ea.com in two
+    GraphQL steps: the account's entitlements (paged), then the catalog
+    offers behind them for their names.
 
 The endpoint and field names were learned from the open-source Maxima
 launcher (github.com/ArmchairDevelopers/Maxima); none of its code is used.
@@ -68,37 +67,46 @@ USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.3
 # answering, so every request carries one and a timeout.
 TIMEOUT = 30
 
-# MICRO_CONTENT, EXPANSION_PACK, BUNDLE_PACK and BASE_GAME fail the schema's
-# validation for this field, so only these four are asked for.
-PRODUCT_TYPES = ["DIGITAL_FULL_GAME", "PACKAGED_FULL_GAME",
-                 "DIGITAL_EXTRA_CONTENT", "PACKAGED_EXTRA_CONTENT"]
-# Games bought on Steam or Epic and linked to the EA account count as owned.
+# Entitlements from every storefront count: games bought on Steam or Epic
+# and linked to the EA account show up too.
 STOREFRONTS = ["EA", "STEAM", "EPIC"]
-PAGE_SIZE = 500
+PAGE_SIZE = 200
+OFFER_BATCH = 50
 
-OWNED_GAMES_QUERY = """
-query ownedGames($next: String, $limit: Int, $type: [GameProductType!]!,
-                 $storefronts: [UserGameProductStorefront!],
-                 $platforms: [GamePlatform!]!) {
+# The EA app's own library query (me.ownedGameProducts) answers web tokens
+# with an empty list, even for an account that owns games. The older
+# entitlements list behind it does answer them, so the library is built
+# from that: entitlements say what the account holds, catalog offers say
+# what each one is called.
+ENTITLEMENTS_QUERY = """
+query entitlements($limit: Int, $next: String,
+                   $storefronts: [UserLegacyEntitlementStorefront!]!) {
   me {
-    ownedGameProducts(storefronts: $storefronts, productFound: true,
-                      paging: {limit: $limit, next: $next}, type: $type,
-                      platforms: $platforms) {
+    legacyEntitlements(paging: {limit: $limit, next: $next},
+                       storefronts: $storefronts, status: [ACTIVE, DISABLED]) {
       next
-      totalCount
       items {
-        originOfferId
-        product {
-          name
-          baseItem { title gameType }
-          gameProductUser(storefronts: $storefronts) {
-            ownershipMethods
-            initialEntitlementDate
-            status
-          }
-        }
+        productId
+        entitlementTag
+        entitlementType
+        groupName
+        status
+        grantDate
+        isSubscription
+        isSubscriptionExpired
       }
     }
+  }
+}
+"""
+
+OFFERS_QUERY = """
+query offers($offerIds: [String!]!, $locale: Locale) {
+  legacyOffers(offerIds: $offerIds, locale: $locale) {
+    id
+    displayName
+    displayType
+    primaryMasterTitleId
   }
 }
 """
@@ -155,36 +163,79 @@ def parse_token_response(status_code, text, location=""):
     return "offline", None
 
 
-def parse_owned_page(payload):
-    """(items, next_cursor, total) from one GraphQL reply. Raises
-    EaAuthRejected for an auth error and RuntimeError for any other error."""
+def _raise_for_errors(payload):
+    """Raise EaAuthRejected for an auth error, RuntimeError for any other."""
     errors = payload.get("errors") or []
-    if errors:
-        if any((e.get("extensions") or {}).get("code") == "UNAUTHENTICATED"
-               for e in errors):
-            raise EaAuthRejected("EA's library service rejected the token.")
-        raise RuntimeError("EA library query failed: "
-                           + "; ".join(str(e.get("message")) for e in errors)[:300])
+    if not errors:
+        return
+    if any((e.get("extensions") or {}).get("code") == "UNAUTHENTICATED"
+           for e in errors):
+        raise EaAuthRejected("EA's library service rejected the token.")
+    raise RuntimeError("EA library query failed: "
+                       + "; ".join(str(e.get("message")) for e in errors)[:300])
+
+
+def parse_entitlements_page(payload):
+    """(entitlements, next_cursor) from one legacyEntitlements reply."""
+    _raise_for_errors(payload)
     page = (((payload.get("data") or {}).get("me") or {})
-            .get("ownedGameProducts") or {})
-    items = []
+            .get("legacyEntitlements") or {})
+    out = []
     for it in page.get("items") or []:
-        product = it.get("product") or {}
-        base = product.get("baseItem") or {}
-        user = product.get("gameProductUser") or {}
-        name = product.get("name") or base.get("title") or ""
-        if not name:
+        if not it.get("productId"):
             continue
-        items.append({
-            "offer_id": it.get("originOfferId") or "",
-            "name": name,
-            "base_title": base.get("title") or "",
-            "game_type": base.get("gameType") or "",
-            "ownership": [str(m) for m in user.get("ownershipMethods") or []],
-            "entitled_at": user.get("initialEntitlementDate") or "",
-            "status": user.get("status") or "",
+        out.append({
+            "product_id": it["productId"],
+            "tag": it.get("entitlementTag") or "",
+            "type": it.get("entitlementType") or "",
+            "group": it.get("groupName") or "",
+            "status": it.get("status") or "",
+            "granted_at": it.get("grantDate") or "",
+            "subscription": bool(it.get("isSubscription")),
+            "subscription_expired": bool(it.get("isSubscriptionExpired")),
         })
-    return items, page.get("next"), page.get("totalCount")
+    return out, page.get("next")
+
+
+def parse_offers(payload):
+    """{offer_id: {name, display_type, master_title_id}} from a
+    legacyOffers reply. Offers the catalog doesn't name are left out."""
+    _raise_for_errors(payload)
+    out = {}
+    for o in (payload.get("data") or {}).get("legacyOffers") or []:
+        if o and o.get("id") and o.get("displayName"):
+            out[o["id"]] = {"name": o["displayName"],
+                            "display_type": o.get("displayType") or "",
+                            "master_title_id": o.get("primaryMasterTitleId") or ""}
+    return out
+
+
+def build_library(entitlements, offers):
+    """One entry per named product. `owned` means the entitlement is
+    active and not a lapsed subscription grant (EA Play titles leave when
+    the subscription does). Entitlements with no catalog name, which are
+    mostly internal access flags, are dropped."""
+    library = {}
+    for e in entitlements:
+        offer = offers.get(e["product_id"])
+        if offer is None:
+            continue
+        owned = (e["status"] == "ACTIVE"
+                 and not (e["subscription"] and e["subscription_expired"]))
+        entry = library.get(e["product_id"])
+        if entry is not None and (entry["owned"] or not owned):
+            continue  # keep the first active grant of a product
+        library[e["product_id"]] = {
+            "offer_id": e["product_id"],
+            "name": offer["name"],
+            "display_type": offer["display_type"],
+            "master_title_id": offer["master_title_id"],
+            "status": e["status"],
+            "granted_at": e["granted_at"],
+            "subscription": e["subscription"],
+            "owned": owned,
+        }
+    return sorted(library.values(), key=lambda g: g["name"].lower())
 
 
 def _all_cookies(driver):
@@ -334,6 +385,16 @@ class EaClient:
             self._token, self._token_expires = token, time.time() + 50 * 60
             return token
 
+    def account_name(self):
+        """The signed-in EA ID (display name), or '' if EA won't say."""
+        try:
+            payload = self._gql(self._access_token(), "me",
+                                "query me { me { player { displayName } } }", {})
+            return ((((payload.get("data") or {}).get("me") or {})
+                     .get("player") or {}).get("displayName") or "")
+        except Exception:
+            return ""
+
     # ---------------- interactive sign-in ----------------
 
     def start_interactive_login(self):
@@ -407,15 +468,10 @@ class EaClient:
 
     # ---------------- library ----------------
 
-    def _query(self, token, cursor):
-        body = {
-            "operationName": "ownedGames",
-            "query": OWNED_GAMES_QUERY,
-            "variables": {"next": cursor, "limit": PAGE_SIZE,
-                          "type": PRODUCT_TYPES, "storefronts": STOREFRONTS,
-                          "platforms": ["PC"]},
-        }
-        r = requests.post(EA_GRAPHQL, json=body, timeout=TIMEOUT,
+    def _gql(self, token, operation, query, variables):
+        r = requests.post(EA_GRAPHQL, timeout=TIMEOUT,
+                          json={"operationName": operation, "query": query,
+                                "variables": variables},
                           headers={"User-Agent": USER_AGENT,
                                    "Authorization": f"Bearer {token}"})
         try:
@@ -427,7 +483,7 @@ class EaClient:
         return payload
 
     def get_owned(self):
-        """Every owned product as parse_owned_page() dicts. If the library
+        """Every product on the account as build_library() dicts. If the library
         service refuses one client's token, the next client's is tried."""
         token = self._access_token()
         rejected = []
@@ -447,14 +503,22 @@ class EaClient:
                 self._token, self._token_expires = token, time.time() + 50 * 60
 
     def _get_owned_with(self, token):
-        owned, cursor, seen = [], "0", set()
+        entitlements, cursor, seen = [], "0", set()
         for _ in range(50):  # backstop against a pager loop
-            items, cursor, _total = parse_owned_page(self._query(token, cursor))
-            owned.extend(items)
-            if not items or not cursor or cursor in seen:
+            page, cursor = parse_entitlements_page(self._gql(
+                token, "entitlements", ENTITLEMENTS_QUERY,
+                {"limit": PAGE_SIZE, "next": cursor, "storefronts": STOREFRONTS}))
+            entitlements.extend(page)
+            if not page or not cursor or cursor in seen:
                 break
             seen.add(cursor)
-        return owned
+        ids = sorted({e["product_id"] for e in entitlements})
+        offers = {}
+        for i in range(0, len(ids), OFFER_BATCH):
+            offers.update(parse_offers(self._gql(
+                token, "offers", OFFERS_QUERY,
+                {"offerIds": ids[i:i + OFFER_BATCH], "locale": "en"})))
+        return build_library(entitlements, offers)
 
 
 # ---------------- probe: python -m redeemer.ea_client ----------------
@@ -524,16 +588,23 @@ def _probe(argv):
         print(f"failed: {e.__class__.__name__}: {e}")
         return 1
 
-    print(f"EA says you own {len(owned)} products (token from {client.token_client}).")
-    methods = {}
-    for g in owned:
-        for m in g["ownership"] or ["(none listed)"]:
-            methods[m] = methods.get(m, 0) + 1
-    print("Ownership methods: " + ", ".join(f"{k}: {v}" for k, v in sorted(methods.items())))
-    for g in owned[:15]:
-        print(f"  {g['name']}  [{', '.join(g['ownership']) or '-'}]  {g['entitled_at'][:10]}")
-    if len(owned) > 15:
-        print(f"  ... and {len(owned) - 15} more")
+    name = client.account_name()
+    print(f"Signed in as: {name or '(EA did not say)'} (token from {client.token_client})")
+    held = [g for g in owned if g["owned"]]
+    print(f"EA lists {len(owned)} products on this account, {len(held)} currently owned.")
+    kinds = {}
+    for g in held:
+        kinds[g["display_type"] or "?"] = kinds.get(g["display_type"] or "?", 0) + 1
+    print("By type: " + (", ".join(f"{k}: {v}" for k, v in sorted(kinds.items())) or "none"))
+    for g in owned[:25]:
+        flags = [g["display_type"] or "?"]
+        if g["subscription"]:
+            flags.append("subscription")
+        if not g["owned"]:
+            flags.append(g["status"].lower() or "not owned")
+        print(f"  {g['name']}  [{', '.join(flags)}]  {g['granted_at'][:10]}")
+    if len(owned) > 25:
+        print(f"  ... and {len(owned) - 25} more")
     return 0
 
 

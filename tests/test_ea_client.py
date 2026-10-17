@@ -2,16 +2,17 @@
 
 A token counts only when EA hands one over; EA's own login_required answer
 means signed out; anything else (HTML, a 5xx, junk) proves nothing and reads
-as offline. The library parser must surface an auth rejection distinctly,
+as offline. The library parsers must surface an auth rejection distinctly,
 since that's the one failure that means the web-token approach itself
-stopped working. Fake responses only, no network.
+stopped working, and only active, non-lapsed grants count as owned. Fake responses only, no network.
 """
 import json
 
 import pytest
 
 from redeemer import ea_client
-from redeemer.ea_client import (EaAuthRejected, EaClient, parse_owned_page,
+from redeemer.ea_client import (EaAuthRejected, EaClient, build_library,
+                                parse_entitlements_page, parse_offers,
                                 parse_token_response)
 
 
@@ -37,77 +38,126 @@ def test_anything_else_is_offline(status, text):
     assert parse_token_response(status, text) == ("offline", None)
 
 
-def _page(items, next_cursor=None, total=None):
-    return {"data": {"me": {"ownedGameProducts": {
-        "next": next_cursor, "totalCount": total, "items": items}}}}
+def _ent(product_id, status="ACTIVE", subscription=False, expired=False,
+         granted="2021-03-04T10:00:00Z"):
+    return {"productId": product_id, "entitlementTag": "ONLINE_ACCESS",
+            "entitlementType": "DEFAULT", "groupName": "", "status": status,
+            "grantDate": granted, "isSubscription": subscription,
+            "isSubscriptionExpired": expired}
 
 
-def _item(name, methods=("REDEMPTION",), offer="Origin.OFR.1", base_title=None):
-    return {"originOfferId": offer, "product": {
-        "name": name,
-        "baseItem": {"title": base_title or name, "gameType": "BASE_GAME"},
-        "gameProductUser": {"ownershipMethods": list(methods),
-                            "initialEntitlementDate": "2021-03-04T10:00:00Z",
-                            "status": "ACTIVE"}}}
+def _ents(items, next_cursor=None):
+    return {"data": {"me": {"legacyEntitlements": {"next": next_cursor, "items": items}}}}
 
 
-def test_owned_page_flattens_items():
-    items, cursor, total = parse_owned_page(_page(
-        [_item("Mass Effect™ Legendary Edition", base_title="Mass Effect Legendary Edition")],
-        next_cursor="500", total=1))
-    assert cursor == "500" and total == 1
-    assert items == [{
-        "offer_id": "Origin.OFR.1",
-        "name": "Mass Effect™ Legendary Edition",
-        "base_title": "Mass Effect Legendary Edition",
-        "game_type": "BASE_GAME",
-        "ownership": ["REDEMPTION"],
-        "entitled_at": "2021-03-04T10:00:00Z",
-        "status": "ACTIVE",
-    }]
+def _offers(*pairs):
+    return {"data": {"legacyOffers": [
+        {"id": i, "displayName": n, "displayType": "FullGame", "primaryMasterTitleId": "1"}
+        for i, n in pairs]}}
 
 
-def test_owned_page_skips_nameless_and_tolerates_missing_fields():
-    items, _, _ = parse_owned_page(_page([
-        {"originOfferId": "x", "product": {}},
-        {"originOfferId": "y", "product": {"baseItem": {"title": "Only Base Title"}}},
-    ]))
-    assert [i["name"] for i in items] == ["Only Base Title"]
-    assert items[0]["ownership"] == []
+UNAUTH = {"data": None, "errors": [{"message": "Not authenticated.",
+                                    "extensions": {"code": "UNAUTHENTICATED"}}]}
 
 
-def test_unauthenticated_error_is_auth_rejected():
-    payload = {"data": None, "errors": [{"message": "Not authenticated.",
-                                         "extensions": {"code": "UNAUTHENTICATED"}}]}
+def test_entitlements_page_flattens_items_and_skips_productless():
+    items, cursor = parse_entitlements_page(_ents(
+        [_ent("Origin.OFR.1", subscription=True), {"status": "ACTIVE"}], next_cursor="200"))
+    assert cursor == "200"
+    assert items == [{"product_id": "Origin.OFR.1", "tag": "ONLINE_ACCESS", "type": "DEFAULT",
+                      "group": "", "status": "ACTIVE", "granted_at": "2021-03-04T10:00:00Z",
+                      "subscription": True, "subscription_expired": False}]
+
+
+def test_offers_keep_only_named_ones():
+    payload = {"data": {"legacyOffers": [
+        {"id": "a", "displayName": "It Takes Two", "displayType": "FullGame"},
+        {"id": "b", "displayName": None}, None]}}
+    assert parse_offers(payload) == {"a": {"name": "It Takes Two", "display_type": "FullGame",
+                                           "master_title_id": ""}}
+
+
+@pytest.mark.parametrize("parser", [parse_entitlements_page, parse_offers])
+def test_unauthenticated_error_is_auth_rejected(parser):
     with pytest.raises(EaAuthRejected):
-        parse_owned_page(payload)
+        parser(UNAUTH)
 
 
 def test_other_graphql_error_is_plain_runtime_error():
-    payload = {"data": None, "errors": [{"message": "Graphql validation error"}]}
     with pytest.raises(RuntimeError) as e:
-        parse_owned_page(payload)
+        parse_entitlements_page({"data": None, "errors": [{"message": "Graphql validation error"}]})
     assert not isinstance(e.value, EaAuthRejected)
     assert "validation" in str(e.value)
 
 
-def test_get_owned_walks_every_page(monkeypatch):
-    pages = {"0": _page([_item("A")], next_cursor="500"),
-             "500": _page([_item("B")], next_cursor="1000"),
-             "1000": _page([], next_cursor=None)}
-    asked = []
+def test_library_owned_means_active_and_not_a_lapsed_subscription():
+    ents = [_ent("bought"), _ent("revoked", status="DISABLED"),
+            _ent("ea_play_live", subscription=True),
+            _ent("ea_play_gone", subscription=True, expired=True),
+            _ent("access_flag")]  # no catalog name: an internal flag, dropped
+    offers = {k: {"name": k, "display_type": "FullGame", "master_title_id": ""}
+              for k in ("bought", "revoked", "ea_play_live", "ea_play_gone")}
+    parsed, _ = parse_entitlements_page(_ents(ents))
+    lib = {g["offer_id"]: g["owned"] for g in build_library(parsed, offers)}
+    assert lib == {"bought": True, "revoked": False, "ea_play_live": True, "ea_play_gone": False}
+
+
+def test_library_prefers_an_active_grant_over_a_disabled_duplicate():
+    offers = {"x": {"name": "X", "display_type": "FullGame", "master_title_id": ""}}
+    for order in ([_ent("x", status="DISABLED"), _ent("x")], [_ent("x"), _ent("x", status="DISABLED")]):
+        parsed, _ = parse_entitlements_page(_ents(order))
+        (game,) = build_library(parsed, offers)
+        assert game["owned"] is True
+
+
+class FakeGql:
+    """Stands in for EaClient._gql: entitlement pages by cursor, offer names
+    by id, and an optional set of tokens to refuse."""
+    def __init__(self, pages, names, refuse=()):
+        self.pages, self.names, self.refuse = pages, names, set(refuse)
+        self.cursors, self.offer_batches = [], []
+
+    def __call__(self, token, operation, query, variables):
+        if token in self.refuse:
+            return UNAUTH
+        if operation == "entitlements":
+            self.cursors.append(variables["next"])
+            return self.pages[variables["next"]]
+        self.offer_batches.append(list(variables["offerIds"]))
+        return _offers(*[(i, self.names[i]) for i in variables["offerIds"] if i in self.names])
+
+
+def test_get_owned_walks_every_page_then_names_them(monkeypatch):
+    gql = FakeGql({"0": _ents([_ent("a")], next_cursor="200"),
+                   "200": _ents([_ent("b")], next_cursor="400"),
+                   "400": _ents([], next_cursor=None)},
+                  {"a": "Alpha", "b": "Beta"})
     client = EaClient()
     monkeypatch.setattr(client, "_access_token", lambda: "tok")
-    monkeypatch.setattr(client, "_query", lambda tok, cur: asked.append(cur) or pages[cur])
-    assert [g["name"] for g in client.get_owned()] == ["A", "B"]
-    assert asked == ["0", "500", "1000"]
+    monkeypatch.setattr(client, "_gql", gql)
+    assert [g["name"] for g in client.get_owned()] == ["Alpha", "Beta"]
+    assert gql.cursors == ["0", "200", "400"]
+    assert gql.offer_batches == [["a", "b"]]
 
 
 def test_get_owned_stops_on_a_repeating_cursor(monkeypatch):
+    gql = FakeGql({"0": _ents([_ent("a")], next_cursor="200"),
+                   "200": _ents([_ent("a")], next_cursor="200")}, {"a": "Alpha"})
     client = EaClient()
     monkeypatch.setattr(client, "_access_token", lambda: "tok")
-    monkeypatch.setattr(client, "_query", lambda tok, cur: _page([_item("A")], next_cursor="500"))
-    assert len(client.get_owned()) == 2  # "0" then "500" once; the repeat ends it
+    monkeypatch.setattr(client, "_gql", gql)
+    assert len(client.get_owned()) == 1
+    assert gql.cursors == ["0", "200"]
+
+
+def test_get_owned_names_offers_in_batches(monkeypatch):
+    ids = [f"id{i:03d}" for i in range(ea_client.OFFER_BATCH + 5)]
+    gql = FakeGql({"0": _ents([_ent(i) for i in ids])}, {i: i.upper() for i in ids})
+    client = EaClient()
+    monkeypatch.setattr(client, "_access_token", lambda: "tok")
+    monkeypatch.setattr(client, "_gql", gql)
+    assert len(client.get_owned()) == len(ids)
+    assert [len(b) for b in gql.offer_batches] == [ea_client.OFFER_BATCH, 5]
 
 
 def test_redirect_carrying_token_in_fragment_is_ok():
@@ -203,13 +253,7 @@ def test_get_owned_retries_with_the_next_client_when_a_token_is_rejected(monkeyp
         302, "", {"Location": "https://www.ea.com/static-pages/auth.html#access_token=dx"})))
     client = EaClient()
     assert client.try_cookie_login() is True
-
-    def query(token, cursor):
-        if token == "js":
-            return {"data": None, "errors": [{"message": "Not authenticated.",
-                                              "extensions": {"code": "UNAUTHENTICATED"}}]}
-        return _page([_item("A")])
-    monkeypatch.setattr(client, "_query", query)
+    monkeypatch.setattr(client, "_gql", FakeGql({"0": _ents([_ent("a")])}, {"a": "A"}, refuse={"js"}))
     assert [g["name"] for g in client.get_owned()] == ["A"]
     assert client.token_client == "DX_DROP_JS_WEB_APP"
 
@@ -220,8 +264,7 @@ def test_get_owned_gives_up_once_every_client_is_rejected(monkeypatch):
         302, "", {"Location": "https://www.ea.com/static-pages/auth.html#access_token=dx"})))
     client = EaClient()
     client.try_cookie_login()
-    monkeypatch.setattr(client, "_query", lambda token, cursor: {
-        "errors": [{"extensions": {"code": "UNAUTHENTICATED"}}]})
+    monkeypatch.setattr(client, "_gql", FakeGql({}, {}, refuse={"js", "dx"}))
     with pytest.raises(EaAuthRejected) as e:
         client.get_owned()
     assert "ORIGIN_JS_SDK, DX_DROP_JS_WEB_APP" in str(e.value)
