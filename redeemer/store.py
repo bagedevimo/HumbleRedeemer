@@ -132,6 +132,23 @@ CREATE TABLE IF NOT EXISTS market_prices (
     currency INTEGER NOT NULL DEFAULT 1,
     fetched_at TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS friends (
+    steamid TEXT PRIMARY KEY,
+    persona TEXT NOT NULL DEFAULT '',
+    avatar TEXT NOT NULL DEFAULT '',
+    profile_url TEXT NOT NULL DEFAULT '',
+    visibility TEXT NOT NULL DEFAULT 'unknown',  -- see friends.py
+    game_count INTEGER,
+    error TEXT NOT NULL DEFAULT '',
+    added_at TEXT NOT NULL DEFAULT '',
+    synced_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS friend_library (
+    steamid TEXT NOT NULL,
+    appid INTEGER NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (steamid, appid)
+);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_keys_status ON humble_keys(redeem_status);
 CREATE INDEX IF NOT EXISTS idx_inv_mhn ON steam_inventory(market_hash_name);
@@ -353,6 +370,66 @@ class Store:
         with self._lock:
             row = self._conn.execute("SELECT MAX(synced_at) t FROM steam_library").fetchone()
         return row["t"] or ""
+
+    # ---------------- friends ----------------
+
+    def add_friend(self, steamid):
+        """Returns True if the friend is new."""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO friends(steamid,added_at) VALUES(?,?)",
+                (steamid, now()))
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def remove_friend(self, steamid):
+        with self._lock:
+            self._conn.execute("DELETE FROM friend_library WHERE steamid=?", (steamid,))
+            cur = self._conn.execute("DELETE FROM friends WHERE steamid=?", (steamid,))
+            self._conn.commit()
+        return cur.rowcount
+
+    def update_friend(self, steamid, summary=None, visibility=None, library=None,
+                      error=""):
+        """Record one fetch. library is {appid: name} for a readable library,
+        or None to clear the cache (the friend went private)."""
+        fields = {"error": error, "synced_at": now()}
+        if summary:
+            fields.update(persona=summary.get("personaname", ""),
+                          avatar=summary.get("avatarmedium", ""),
+                          profile_url=summary.get("profileurl", ""))
+        if visibility:
+            fields["visibility"] = visibility
+            fields["game_count"] = len(library) if library is not None else None
+        with self._lock:
+            sets = ", ".join(f"{k}=?" for k in fields)
+            self._conn.execute(f"UPDATE friends SET {sets} WHERE steamid=?",
+                               (*fields.values(), steamid))
+            if visibility:
+                self._conn.execute("DELETE FROM friend_library WHERE steamid=?", (steamid,))
+                if library:
+                    self._conn.executemany(
+                        "INSERT INTO friend_library(steamid,appid,name) VALUES(?,?,?)",
+                        [(steamid, appid, name) for appid, name in library.items()])
+            self._conn.commit()
+
+    def get_friends(self):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM friends ORDER BY persona COLLATE NOCASE, steamid").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_friend_libraries(self):
+        """{steamid: {appid: name}} for readable libraries, None for the rest
+        — the shape friends.annotate_spares takes."""
+        with self._lock:
+            friends = self._conn.execute("SELECT steamid, visibility FROM friends").fetchall()
+            rows = self._conn.execute("SELECT * FROM friend_library").fetchall()
+        libs = {f["steamid"]: ({} if f["visibility"] == "public" else None) for f in friends}
+        for r in rows:
+            if libs.get(r["steamid"]) is not None:
+                libs[r["steamid"]][r["appid"]] = r["name"]
+        return libs
 
     # ---------------- gog library ----------------
 

@@ -4,7 +4,7 @@ import time
 import traceback
 from collections import deque
 
-from . import matching
+from . import friends, matching
 from .steam_client import code_to_label, valid_steam_key
 
 
@@ -92,6 +92,7 @@ class JobRunner:
                 "sync_gog": self._job_sync_gog,
                 "redeem_gog": self._job_redeem_gog,
                 "verify_spares": self._job_verify_spares,
+                "sync_friends": self._job_sync_friends,
                 "scan_inventory": self._job_scan_inventory,
                 "price_inventory": self._job_price_inventory,
                 "list_market": self._job_list_market,
@@ -646,6 +647,25 @@ class JobRunner:
         self._say("GOG redemption finished — "
                   + ", ".join(f"{k}: {v}" for k, v in stats.items()))
 
+    def _job_sync_friends(self, params):
+        api_key = self.store.get_settings().get("steam_api_key", "").strip()
+        if not api_key:
+            raise RuntimeError("Checking friends' libraries needs a Steam Web API key in Settings.")
+        sids = [f["steamid"] for f in self.store.get_friends()]
+        if not sids:
+            self._say("No friends added yet.")
+            return
+        self._say(f"Checking {len(sids)} friends' libraries...", phase="sync_friends")
+        failed = refresh_friends(self.store, self.steam, api_key, sids,
+                                 progress=self._progress, cancel=self._cancel)
+        readable = sum(1 for lib in self.store.get_friend_libraries().values()
+                       if lib is not None)
+        self.store.log_event("sync_friends", detail=f"{len(sids)} friends, {readable} readable")
+        msg = f"Friends checked: {readable} of {len(sids)} have a public library."
+        if failed:
+            msg += f" {len(failed)} couldn't be fetched (see the friends card)."
+        self._say(msg)
+
     def _job_verify_spares(self, params):
         """Resolve legacy 'verify first' spares by re-attempting them on Steam.
 
@@ -905,6 +925,35 @@ class JobRunner:
         append_legacy_csv(status, key)
         self.store.record_legacy_row(status, key["gamekey"], key["human_name"],
                                      key["redeemed_key_val"])
+
+
+def refresh_friends(store, steam, api_key, steamids, progress=None, cancel=None):
+    """Re-read each friend's profile and library into the store. One friend
+    failing (network, Steam hiccup) is recorded against that friend and the
+    rest carry on. Returns the steamids that failed."""
+    summaries = steam.get_player_summaries(api_key, steamids)
+    failed = []
+    for i, sid in enumerate(steamids):
+        if cancel is not None and cancel.is_set():
+            break
+        if progress:
+            progress(i + 1, len(steamids))
+        summary = summaries.get(sid)
+        if summary is None:
+            store.update_friend(sid, visibility=friends.UNKNOWN, library=None,
+                                error="Steam has no profile with this ID.")
+            failed.append(sid)
+            continue
+        try:
+            visibility, library = steam.get_friend_library(api_key, sid)
+        except Exception as e:
+            store.update_friend(sid, summary, error=f"Library fetch failed: {e}")
+            failed.append(sid)
+            continue
+        if library is None and summary.get("communityvisibilitystate") != 3:
+            visibility = friends.PROFILE_PRIVATE
+        store.update_friend(sid, summary, visibility, library)
+    return failed
 
 
 def can_reveal(key):

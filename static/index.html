@@ -121,6 +121,10 @@ tbody tr:hover { background: var(--page); }
   border: 1px solid var(--border); background: var(--btn-bg); color: var(--ink-1);
 }
 .fchip { cursor: pointer; }
+.friend { display: inline-flex; align-items: center; gap: 6px; padding: 3px 6px 3px 3px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--btn-bg); font-size: 12.5px; }
+.friend img { width: 22px; height: 22px; border-radius: 50%; }
+.friend .x { background: none; border: none; color: var(--ink-muted); cursor: pointer; padding: 0 2px; font-size: 13px; }
 .fchip.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
 .tablewrap { max-height: 65vh; overflow: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-1); }
 .mini { font-size: 11.5px; color: var(--ink-muted); }
@@ -302,8 +306,32 @@ dialog input {
       <span class="tag warn">could be this key</span> means a product key created that ownership and no record explains which one.
     </p>
   </div>
+  <div class="card" style="margin-bottom:12px">
+    <h3>Friends</h3>
+    <p class="section-note">
+      Add friends to see which spares they don't own yet. Pick a filter below to narrow
+      the list to one friend, and the roller, copy, and export buttons all follow it.
+      Steam only shares libraries whose <b>Game details</b> privacy is <b>Public</b>; anyone else shows
+      as <span class="tag warn">games hidden</span> and can't be checked. DLC never shows up in a
+      Steam library, so DLC spares always look unowned.
+    </p>
+    <form class="actions" onsubmit="addFriend(event)" style="align-items:center">
+      <input type="text" id="friendq" list="friendsugg" autocomplete="off"
+        placeholder="Friend name, SteamID64, or profile link"
+        style="font:inherit;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--btn-bg);color:var(--ink-1);flex:1;min-width:240px">
+      <datalist id="friendsugg"></datalist>
+      <button class="btn primary" type="submit">Add friend</button>
+      <button class="btn" type="button" onclick="refreshFriends()">Refresh libraries</button>
+    </form>
+    <div class="msg" id="friendmsg"></div>
+    <div id="friendlist" class="actions" style="margin-top:6px"></div>
+  </div>
   <div class="filters">
     <input type="search" id="gsearch" placeholder="Search spares…">
+    <select id="gfriend" title="only show spares this friend doesn't own"
+      style="font:inherit;padding:7px 10px;border-radius:8px;border:1px solid var(--border);background:var(--btn-bg);color:var(--ink-1)">
+      <option value="">All spares</option>
+    </select>
     <label class="check" style="font-size:12.5px"><input type="checkbox" id="gshowgiven"> show given-away</label>
   </div>
   <div class="actions" style="margin-bottom:10px">
@@ -326,7 +354,7 @@ dialog input {
     <table id="givetable">
       <thead><tr>
         <th><input type="checkbox" id="gcheckall" title="select all good-to-go spares"></th>
-        <th>Title</th><th>Key / gift link</th><th>Expires</th><th>Why it's spare</th><th>Ownership</th><th>Given</th><th></th>
+        <th>Title</th><th>Key / gift link</th><th>Expires</th><th>Why it's spare</th><th>Ownership</th><th>Friends without it</th><th>Given</th><th></th>
       </tr></thead>
       <tbody></tbody>
     </table>
@@ -348,7 +376,7 @@ dialog input {
       <table id="givetable2">
         <thead><tr>
           <th><input type="checkbox" id="gcheckall2" title="select all likely-redeemed spares"></th>
-          <th>Title</th><th>Key / gift link</th><th>Expires</th><th>Why it's spare</th><th>Ownership</th><th>Given</th><th></th>
+          <th>Title</th><th>Key / gift link</th><th>Expires</th><th>Why it's spare</th><th>Ownership</th><th>Friends without it</th><th>Given</th><th></th>
         </tr></thead>
         <tbody></tbody>
       </table>
@@ -648,7 +676,7 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   ["dashboard","library","giveaway","attention","inventory","settings"].forEach(t =>
     $("#tab-" + t).style.display = (t === b.dataset.tab ? "" : "none"));
   if (b.dataset.tab === "library") loadGames();
-  if (b.dataset.tab === "giveaway") loadSpares();
+  if (b.dataset.tab === "giveaway") { loadSpares(); loadFriends(); }
   if (b.dataset.tab === "attention") loadAttention();
   if (b.dataset.tab === "inventory") loadInventory();
   if (b.dataset.tab === "settings") fillSettings();
@@ -1180,6 +1208,7 @@ async function loadSpares() {
   renderSpares();
 }
 $("#gsearch").oninput = () => renderSpares();
+$("#gfriend").onchange = () => renderSpares();
 $("#gshowgiven").onchange = () => loadSpares();
 $("#gcheckall").onchange = e => {
   [...goodSpares(), ...pairUnits().flat()].forEach(g =>
@@ -1193,7 +1222,9 @@ $("#gcheckall2").onchange = e => {
 
 function visibleSpares() {
   const q = $("#gsearch").value.trim().toLowerCase();
-  return spares.filter(g => !q || g.human_name.toLowerCase().includes(q));
+  const f = $("#gfriend").value;
+  return spares.filter(g => (!q || g.human_name.toLowerCase().includes(q))
+    && (!f || (g.friends_lacking || []).includes(f)));
 }
 const isLikelyRedeemed = g => g.license_provenance === "retail_suspect";
 const nameKey = g => g.human_name.trim().toLowerCase();
@@ -1320,6 +1351,7 @@ function spareRow(g) {
     <td>${fmtExpiry(g)}</td>
     <td>${spareWhy(g)}</td>
     <td>${provTag(g)}</td>
+    <td>${friendsCell(g)}</td>
     <td>${g.given_away ? `<span title="given ${esc(g.given_at || "(date unknown)")}">✓</span>` : ""}</td>
     <td style="white-space:nowrap"><button class="btn" style="padding:2px 8px;font-size:11.5px" title="draft an email with this key"
         onclick="emailOne(${g.id})">✉ email</button>${g.gamekey === "manual"
@@ -1339,6 +1371,7 @@ function pairRow(rows) {
     <td>${fmtExpiry(rows[0])}</td>
     <td>${spareWhy(rows[0])}</td>
     <td><span class="tag warn" title="Steam's license history says one unexplained product key was spent on this game, and you hold ${rows.length} keys for it. Only one can be dead, so at least ${rows.length - 1} of these should work. No way to tell which without testing.">one of these is good</span></td>
+    <td>${friendsCell(rows[0])}</td>
     <td>${allGiven ? "✓" : ""}</td>
     <td><button class="btn" style="padding:2px 8px;font-size:11.5px" title="draft an email with both keys"
         onclick="emailIds('${ids.join(",")}')">✉ email</button></td>
@@ -1472,6 +1505,105 @@ function verifySpares() {
     return;
   startJob("verify_spares");
 }
+/* ---------------- friends ---------------- */
+let friends = [], friendSuggest = [];
+
+const friendName = f => f.persona || f.steamid;
+const VIS_TAG = {
+  public: f => `<span class="tag good" title="Library readable${f.synced_at ? ", checked " + esc(f.synced_at) : ""}">${f.game_count} games</span>`,
+  games_private: () => `<span class="tag warn" title="Their profile is visible but Game details are not Public, so Steam won't say what they own.">games hidden</span>`,
+  profile_private: () => `<span class="tag bad" title="Their whole profile is private, so Steam won't say what they own.">private profile</span>`,
+  unknown: () => `<span class="tag" title="Not checked yet — press Refresh libraries.">unchecked</span>`,
+};
+
+async function loadFriends() {
+  const j = await (await fetch("/api/friends")).json();
+  friends = j.friends;
+  renderFriends();
+  if (!j.has_api_key) {
+    $("#friendmsg").textContent = "Friends need a Steam Web API key in Settings.";
+    return;
+  }
+  if (!friendSuggest.length) loadFriendSuggest();
+}
+
+async function loadFriendSuggest() {
+  const j = await (await fetch("/api/friends/suggest")).json();
+  friendSuggest = j.suggestions || [];
+  if (!j.ok && j.message) $("#friendmsg").textContent = j.message;
+  renderFriendSuggest();
+}
+
+function renderFriendSuggest() {
+  const have = new Set(friends.map(f => f.steamid));
+  // the id rides along in the value so a picked suggestion needs no lookup
+  $("#friendsugg").innerHTML = friendSuggest.filter(s => !have.has(s.steamid)).map(s =>
+    `<option value="${esc(s.persona)} · ${s.steamid}">${s.public ? "" : "profile private"}</option>`).join("");
+}
+
+function renderFriends() {
+  $("#friendlist").innerHTML = friends.length ? friends.map(f => `
+    <span class="friend" title="${esc(f.error || f.steamid)}">
+      ${f.avatar ? `<img src="${esc(f.avatar)}" alt="">` : ""}
+      ${f.profile_url ? `<a href="${esc(f.profile_url)}" target="_blank">${esc(friendName(f))}</a>` : esc(friendName(f))}
+      ${(VIS_TAG[f.visibility] || VIS_TAG.unknown)(f)}${f.error ? ` <span class="tag bad">error</span>` : ""}
+      <button class="x" title="remove" onclick="removeFriend('${f.steamid}')">✕</button>
+    </span>`).join("") : `<span class="mini">No friends added yet.</span>`;
+  const sel = $("#gfriend"), cur = sel.value;
+  sel.innerHTML = `<option value="">All spares</option>` + friends
+    .filter(f => f.visibility === "public")
+    .map(f => `<option value="${f.steamid}">Missing for ${esc(friendName(f))}</option>`).join("");
+  sel.value = friends.some(f => f.steamid === cur && f.visibility === "public") ? cur : "";
+  renderFriendSuggest();
+  if ($("#tab-giveaway").style.display !== "none") renderSpares();
+}
+
+function friendsCell(g) {
+  if (!friends.length) return `<span class="mini">—</span>`;
+  const byId = Object.fromEntries(friends.map(f => [f.steamid, f]));
+  const lacking = (g.friends_lacking || []).map(id => byId[id]).filter(Boolean);
+  const unknown = (g.friends_unknown || []).length;
+  const hint = g.friends_by_name ? " (matched by title: this key has no AppID)" : "";
+  let html = lacking.length
+    ? lacking.slice(0, 3).map(f => `<span class="tag info" title="${esc(friendName(f))} doesn't own this${hint}">${esc(friendName(f))}</span>`).join(" ")
+      + (lacking.length > 3 ? ` <span class="mini" title="${esc(lacking.slice(3).map(friendName).join(", "))}">+${lacking.length - 3}</span>` : "")
+    : (unknown < friends.length ? `<span class="mini" title="every friend we can check owns it${hint}">all own it</span>` : "");
+  if (unknown) html += ` <span class="mini" title="${unknown} friend(s) have hidden libraries and can't be checked">?${unknown}</span>`;
+  return html;
+}
+
+async function addFriend(e) {
+  e.preventDefault();
+  let q = $("#friendq").value.trim();
+  const picked = q.match(/(7656\d{13})\s*$/);
+  if (picked) q = picked[1];
+  if (!q) return;
+  $("#friendmsg").textContent = "Looking them up…";
+  const j = await (await fetch("/api/friends/add", { method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({ query: q }) })).json();
+  if (!j.ok) { $("#friendmsg").textContent = j.message; return; }
+  const f = j.friend;
+  $("#friendmsg").textContent = (j.new ? "Added " : "Re-checked ") + friendName(f)
+    + (f.visibility === "public" ? "." : ": their game library is hidden, so they can't be checked.");
+  $("#friendq").value = "";
+  await loadFriends();
+  loadSpares();
+}
+
+async function removeFriend(steamid) {
+  await fetch("/api/friends/remove", { method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify({ steamid }) });
+  await loadFriends();
+  loadSpares();
+}
+
+async function refreshFriendsDone() { await loadFriends(); loadSpares(); }
+async function refreshFriends() {
+  $("#friendmsg").textContent = "Checking libraries… (progress shows on the dashboard)";
+  await startJob("sync_friends");
+  watchThenLoad("refreshFriendsDone");
+}
+
 /* ---------------- manual keys ---------------- */
 // a key is 3-6 dash-separated groups of 4-5 alphanumerics, or any http(s) link
 const MANUAL_KEY_RX = /((?:[0-9A-Za-z]{4,5}-){2,5}[0-9A-Za-z]{4,5}|https?:\/\/\S+)\s*$/;

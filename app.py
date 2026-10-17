@@ -56,7 +56,8 @@ from redeemer.store import Store
 from redeemer.humble_client import HumbleClient
 from redeemer.steam_client import SteamClient
 from redeemer.gog_client import GogClient
-from redeemer.jobs import JobRunner
+from redeemer.jobs import JobRunner, refresh_friends
+from redeemer import friends as _friends
 from redeemer import attention
 from redeemer import update_check
 from redeemer import update_install
@@ -328,7 +329,7 @@ def api_job():
     if job_type not in ("sync_humble", "sync_steam", "match", "reveal",
                         "redeem", "claim_choices", "verify_licenses",
                         # "sync_gog", "redeem_gog",  # GOG automation disabled for now
-                        "verify_spares",
+                        "verify_spares", "sync_friends",
                         "scan_inventory", "price_inventory", "list_market",
                         "full_auto"):
         return jsonify({"ok": False, "message": "Unknown job type."}), 400
@@ -361,7 +362,101 @@ def api_keys_mark():
 @app.get("/api/giveaway")
 def api_giveaway():
     include_given = request.args.get("include_given") == "1"
-    return jsonify(store.get_giveaway_keys(include_given))
+    spares = store.get_giveaway_keys(include_given)
+    return jsonify(_friends.annotate_spares(spares, store.get_friend_libraries()))
+
+
+def _api_key():
+    return store.get_settings().get("steam_api_key", "").strip()
+
+
+_NEEDS_KEY = "Friends need a Steam Web API key in Settings (the same one the library sync uses)."
+
+
+@app.get("/api/friends")
+def api_friends():
+    return jsonify({"friends": store.get_friends(), "has_api_key": bool(_api_key())})
+
+
+# your Steam friend list for autocomplete, cached so typing doesn't hammer
+# the API: (fetched_at, steamid64, payload)
+_suggest_cache = [0.0, "", None]
+
+
+@app.get("/api/friends/suggest")
+def api_friends_suggest():
+    key = _api_key()
+    me = store.get_settings().get("steam_id_64", "").strip()
+    if not (key and me):
+        return jsonify({"ok": False, "suggestions": [],
+                        "message": "Autocomplete needs a Web API key and your SteamID64 in Settings."})
+    if (_suggest_cache[1] == me and _suggest_cache[2] is not None
+            and time.time() - _suggest_cache[0] < 600
+            and request.args.get("refresh") != "1"):
+        return jsonify(_suggest_cache[2])
+    try:
+        sids = steam.get_friend_list(key, me)
+        if sids is None:
+            payload = {"ok": False, "suggestions": [],
+                       "message": "Steam won't share your friend list (it's not public), "
+                                  "so there's no autocomplete. You can still add friends by ID or link."}
+        else:
+            summaries = steam.get_player_summaries(key, sids)
+            payload = {"ok": True, "suggestions": sorted(
+                ({"steamid": sid, "persona": p.get("personaname", ""),
+                  "public": p.get("communityvisibilitystate") == 3}
+                 for sid, p in summaries.items()),
+                key=lambda s: s["persona"].lower())}
+    except Exception as e:
+        return jsonify({"ok": False, "suggestions": [],
+                        "message": f"Couldn't load your friend list: {e}"})
+    _suggest_cache[:] = [time.time(), me, payload]
+    return jsonify(payload)
+
+
+@app.post("/api/friends/add")
+def api_friends_add():
+    """Add one friend by SteamID64, profile link or custom URL name, and
+    check their library straight away (two quick API calls)."""
+    key = _api_key()
+    if not key:
+        return jsonify({"ok": False, "message": _NEEDS_KEY}), 400
+    data = request.get_json(force=True) or {}
+    kind, value = _friends.parse_friend_input(data.get("query", ""))
+    if kind is None:
+        return jsonify({"ok": False, "message": value}), 400
+    try:
+        sid = value if kind == "steamid" else steam.resolve_vanity(key, value)
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"Steam lookup failed: {e}"})
+    if not sid:
+        return jsonify({"ok": False, "message": f"No Steam profile has the custom URL '{value}'."})
+    if sid == store.get_settings().get("steam_id_64", "").strip():
+        return jsonify({"ok": False, "message": "That's you."}), 400
+    new = store.add_friend(sid)
+    try:
+        failed = refresh_friends(store, steam, key, [sid])
+    except Exception as e:
+        failed, err = [sid], str(e)
+    else:
+        err = ""
+    friend = next((f for f in store.get_friends() if f["steamid"] == sid), None)
+    if failed and friend and not friend["persona"]:
+        # never resolved to a real profile — don't keep a dead row around
+        store.remove_friend(sid)
+        return jsonify({"ok": False, "message": err or friend["error"] or "Steam has no profile with this ID."})
+    if new:
+        store.log_event("friend_add", name=friend["persona"] if friend else "", detail=sid)
+    return jsonify({"ok": True, "new": new, "friend": friend})
+
+
+@app.post("/api/friends/remove")
+def api_friends_remove():
+    data = request.get_json(force=True) or {}
+    n = store.remove_friend(str(data.get("steamid", "")))
+    if n:
+        store.log_event("friend_remove", detail=str(data.get("steamid")))
+    return jsonify({"ok": bool(n)})
 
 
 @app.post("/api/keys/give")

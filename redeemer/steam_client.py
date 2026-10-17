@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import requests
 import steam.webauth as wa
 
+from . import friends
 from .cookie_store import load_cookie_dict, save_cookie_dict
 
 STEAM_KEYS_PAGE = "https://store.steampowered.com/account/registerkey"
@@ -19,6 +20,9 @@ STEAM_LICENSES_PAGE = "https://store.steampowered.com/account/licenses/"
 STEAM_REDEEM_API = "https://store.steampowered.com/account/ajaxregisterkey/"
 STEAM_OWNED_GAMES_API = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/"
 STEAM_USERDATA_API = "https://store.steampowered.com/dynamicstore/userdata/"
+STEAM_PLAYER_SUMMARIES_API = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+STEAM_FRIEND_LIST_API = "https://api.steampowered.com/ISteamUser/GetFriendList/v1/"
+STEAM_RESOLVE_VANITY_API = "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v1/"
 # app 753 (Steam) context 1 is the gifts inventory — multi-pack extras,
 # guest passes, tradable gift copies
 STEAM_GIFT_INVENTORY_API = "https://steamcommunity.com/inventory/{steamid}/753/1"
@@ -307,6 +311,51 @@ class SteamClient:
         if not owned:
             raise RuntimeError("Steam returned an empty owned list — session may be stale.")
         return {appid: f"appid {appid}" for appid in owned}
+
+    # ---------------- friends ----------------
+
+    def get_friend_library(self, api_key, steam_id):
+        """Someone else's library. Unlike get_owned_games, a hidden library
+        is an answer rather than an error: returns (visibility, {appid: name}
+        or None) — see friends.classify_owned_response."""
+        params = {"key": api_key, "steamid": steam_id, "include_appinfo": 1,
+                  "include_played_free_games": 1, "format": "json"}
+        r = requests.get(STEAM_OWNED_GAMES_API, params=params, timeout=60)
+        r.raise_for_status()
+        return friends.classify_owned_response(r.json())
+
+    def get_player_summaries(self, api_key, steam_ids):
+        """{steamid: summary} for up to any number of ids (100 per call).
+        Each summary carries personaname, avatarmedium, profileurl and
+        communityvisibilitystate (3 = public, anything else = hidden)."""
+        out = {}
+        ids = list(steam_ids)
+        for i in range(0, len(ids), 100):
+            r = requests.get(STEAM_PLAYER_SUMMARIES_API, timeout=30, params={
+                "key": api_key, "steamids": ",".join(ids[i:i + 100])})
+            r.raise_for_status()
+            for p in r.json().get("response", {}).get("players", []) or []:
+                out[p["steamid"]] = p
+        return out
+
+    def get_friend_list(self, api_key, steam_id):
+        """Your friends' SteamID64s, or None when Steam won't say (it answers
+        401 when the friend list isn't public)."""
+        r = requests.get(STEAM_FRIEND_LIST_API, timeout=30, params={
+            "key": api_key, "steamid": steam_id, "relationship": "friend"})
+        if r.status_code in (401, 403):
+            return None
+        r.raise_for_status()
+        return [f["steamid"] for f in
+                r.json().get("friendslist", {}).get("friends", []) or []]
+
+    def resolve_vanity(self, api_key, name):
+        """Custom profile URL name -> SteamID64, or None if no such profile."""
+        r = requests.get(STEAM_RESOLVE_VANITY_API, timeout=30, params={
+            "key": api_key, "vanityurl": name, "url_type": 1})
+        r.raise_for_status()
+        resp = r.json().get("response", {})
+        return resp.get("steamid") if resp.get("success") == 1 else None
 
     # ---------------- licenses ----------------
 
